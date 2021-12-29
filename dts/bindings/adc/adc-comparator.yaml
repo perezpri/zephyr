@@ -1,0 +1,38 @@
+# Copyright (c) 2022 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    Comparator will monitor signal though ADC and based on configuration,
+    it will trigger a callback to user to inform signal criterion is met.
+
+    User is responsible for configuring comparator to establish threshold assert
+    value, comparison (less or equal, grater...) and callback handler.
+
+compatible: "adc-comparator"
+
+include: base.yaml
+
+properties:
+    io-channels:
+      type: phandle-array
+      required: true
+      description: |
+        ADC channel that will perform measurement.
+
+    threshold:
+      type: int
+      required: true
+      description: |
+        Raw value present on ADC as threshold assert.
+
+    comparison:
+      type: string
+      required: true
+      description: |
+        Determines relation between measured value and assertion threshold.
+
+    period:
+      type: int
+      required: false
+      description: |
+        Signal sampling period in milliseconds.
