@@ -1,0 +1,9 @@
+# Copyright (c) 2021 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    This will perform signal comparision with threshold established.
+
+compatible: "nuvoton,adc-cmp"
+
+include : adc-comparator.yaml

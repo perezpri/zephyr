@@ -14,6 +14,7 @@
 
 #define ADC_CONTEXT_USES_KERNEL_TIMER
 #include "adc_context.h"
+#include "adc_npcx_threshold.h"
 
 #include <logging/log.h>
 LOG_MODULE_REGISTER(adc_npcx, CONFIG_ADC_LOG_LEVEL);
@@ -37,6 +38,9 @@ LOG_MODULE_REGISTER(adc_npcx, CONFIG_ADC_LOG_LEVEL);
 #define NPCX_ADC_CHN_CONVERSION_MODE	0
 #define NPCX_ADC_SCAN_CONVERSION_MODE	1
 
+/* ADC threshold detector number */
+#define NPCX_ADC_THRESHOLD_COUNT   DT_INST_PROP(0, threshold_count)
+
 /* Device config */
 struct adc_npcx_config {
 	/* adc controller base address */
@@ -45,6 +49,34 @@ struct adc_npcx_config {
 	struct npcx_clk_cfg clk_cfg;
 	/* pinmux configuration */
 	const struct npcx_alt *alts_list;
+};
+
+struct adc_npcx_threshold_control {
+	uint8_t chnsel;
+	bool l_h;
+	uint16_t thrval;
+	struct k_work *work;
+};
+
+struct adc_npcx_threshold_data {
+	/*
+	 * While threshold interruption is enabled we need to resume to repetitive
+	 * sampling mode after adc_npcx_read is called. This variable records
+	 * channels being used in repetitive mode in order to set ADC registers
+	 * back to threshold detection when adc_npcx_read is completed.
+	 */
+	uint16_t repetitive_channels;
+	/*
+	 * While threshold interruption is enabled, adc_npcx_read must disable
+	 * all active threshold running to avoid race condition, this variable
+	 * helps restore active threshods after adc_npcs_read has finnished.
+	 */
+	uint8_t active_thresholds;
+	/*
+	 * This array holds current configuration for each threshold including
+	 * trigger handler.
+	 */
+	struct adc_npcx_threshold_control control[NPCX_ADC_THRESHOLD_COUNT];
 };
 
 /* Driver data */
@@ -64,7 +96,10 @@ struct adc_npcx_data {
 	uint16_t *repeat_buffer;
 	/* end pointer of buffer to ensure enough space for storing ADC data. */
 	uint16_t *buf_end;
+	/* Threshold comparator data pointer */
+	struct adc_npcx_threshold_data *threshold_data;
 };
+
 
 /* Driver convenience defines */
 #define DRV_CONFIG(dev) ((const struct adc_npcx_config *)(dev)->config)
@@ -78,6 +113,7 @@ static void adc_npcx_isr(void *arg)
 {
 	struct adc_npcx_data *const data = DRV_DATA((const struct device *)arg);
 	struct adc_reg *const inst = HAL_INSTANCE((const struct device *)arg);
+	struct adc_npcx_threshold_data *const t_data = data->threshold_data;
 	uint16_t status = inst->ADCSTS;
 	uint16_t result, channel;
 
@@ -86,7 +122,8 @@ static void adc_npcx_isr(void *arg)
 	LOG_DBG("%s: status is %04X\n", __func__, status);
 
 	/* Is end of conversion cycle event? ie. Scan conversion is done. */
-	if (IS_BIT_SET(status, NPCX_ADCSTS_EOCCEV)) {
+	if (IS_BIT_SET(status, NPCX_ADCSTS_EOCCEV) &&
+	    IS_BIT_SET(inst->ADCCNF, NPCX_ADCCNF_INTECEN)) {
 		/* Stop conversion for scan conversion mode */
 		inst->ADCCNF |= BIT(NPCX_ADCCNF_STOP);
 
@@ -106,10 +143,49 @@ static void adc_npcx_isr(void *arg)
 			}
 			data->channels &= ~BIT(channel);
 		}
+		/* Disable End of conversion interruption */
+		inst->ADCCNF &= ~BIT(NPCX_ADCCNF_INTECEN);
 
-		/* Turn off ADC and inform sampling is done */
-		inst->ADCCNF &= ~(BIT(NPCX_ADCCNF_ADCEN));
+		if (IS_ENABLED(CONFIG_ADC_CMP_NPCX) &&
+		    t_data->active_thresholds) {
+			/* Set repetitive channels back */
+			inst->ADCCS = t_data->repetitive_channels;
+
+			/* Restore active thresholds enabled */
+			inst->THRCTS |=	(t_data->active_thresholds <<
+					 NPCX_THRCTS_THR1_IEN);
+
+			/* Set repetitive conversion mode */
+			inst->ADCCNF |= BIT(NPCX_ADCCNF_ADCRPTC);
+
+			/* Start conversion */
+			inst->ADCCNF |= BIT(NPCX_ADCCNF_START);
+		} else {
+			/* Turn off ADC */
+			inst->ADCCNF &= ~(BIT(NPCX_ADCCNF_ADCEN));
+		}
+		/* Inform sampling is done */
 		adc_context_on_sampling_done(&data->ctx, data->adc_dev);
+	}
+
+	if (!IS_ENABLED(CONFIG_ADC_CMP_NPCX) &&
+	    t_data->active_thresholds) {
+		return;
+	}
+	uint16_t thrcts;
+
+	for (uint8_t i = 0; i < NPCX_ADC_THRESHOLD_COUNT; i++) {
+		if (IS_BIT_SET(inst->THRCTS, i) && IS_BIT_SET(inst->THRCTS,
+		    (NPCX_THRCTS_THR1_IEN + i))) {
+			/* Avoid clearing other threshold status */
+			thrcts = inst->THRCTS &
+				 ~GENMASK(NPCX_ADC_THRESHOLD_COUNT - 1, 0);
+			/* Clear threshold status */
+			thrcts |= BIT(i);
+			inst->THRCTS = thrcts;
+			if (t_data->control[i].work)
+				k_work_submit(t_data->control[i].work);
+		}
 	}
 }
 
@@ -150,6 +226,9 @@ static void adc_npcx_start_scan(const struct device *dev)
 	/* Turn on ADC first */
 	inst->ADCCNF |= BIT(NPCX_ADCCNF_ADCEN);
 
+	/* Stop conversion for scan conversion mode */
+	inst->ADCCNF |= BIT(NPCX_ADCCNF_STOP);
+
 	/* Update selected channels in scan mode by channels mask */
 	inst->ADCCS = data->channels;
 
@@ -158,6 +237,17 @@ static void adc_npcx_start_scan(const struct device *dev)
 			NPCX_ADC_SCAN_CONVERSION_MODE);
 
 	/* Select 'One-Shot' Repetitive mode */
+	inst->ADCCNF &= ~BIT(NPCX_ADCCNF_ADCRPTC);
+
+	/* Disable all thresholds inerruptions */
+	inst->THRCTS &=
+		~GENMASK((NPCX_ADC_THRESHOLD_COUNT + NPCX_THRCTS_THR1_IEN) - 1,
+		NPCX_THRCTS_THR1_IEN);
+
+	/* Disable all thresholds interruption status */
+	inst->THRCTS |= GENMASK(NPCX_ADC_THRESHOLD_COUNT - 1, 0);
+
+	/* Enable End of conversion interrupt */
 	inst->ADCCNF |= BIT(NPCX_ADCCNF_INTECEN);
 
 	/* Start conversion */
@@ -296,6 +386,243 @@ static int adc_npcx_read_async(const struct device *dev,
 }
 #endif /* CONFIG_ADC_ASYNC */
 
+static void adc_npcx_set_repetitive(const struct device *dev, int chnsel,
+				    uint8_t enable)
+{
+	struct adc_reg *const inst = HAL_INSTANCE(dev);
+	struct adc_npcx_data *const data = DRV_DATA(dev);
+	struct adc_npcx_threshold_data *const t_data = data->threshold_data;
+
+	/* Stop ADC conversion */
+	inst->ADCCNF |= BIT(NPCX_ADCCNF_STOP);
+
+	if (enable) {
+		/* Turn on ADC */
+		inst->ADCCNF |= BIT(NPCX_ADCCNF_ADCEN);
+		/* Set ADC conversion code to SW conversion mode */
+		SET_FIELD(inst->ADCCNF, NPCX_ADCCNF_ADCMD_FIELD,
+			  NPCX_ADC_SCAN_CONVERSION_MODE);
+		/* Update number of channel to be converted */
+		inst->ADCCS |= BIT(chnsel);
+		/* Set conversion type to repetitive (runs continuously) */
+		inst->ADCCNF |= BIT(NPCX_ADCCNF_ADCRPTC);
+
+		t_data->repetitive_channels |= BIT(chnsel);
+		/* Start conversion */
+		inst->ADCCNF |= BIT(NPCX_ADCCNF_START);
+	} else {
+		inst->ADCCS &= ~BIT(chnsel);
+
+		t_data->repetitive_channels &= ~BIT(chnsel);
+		if (!t_data->repetitive_channels) {
+			/* Turn off ADC */
+			inst->ADCCNF &= ~BIT(NPCX_ADCCNF_ADCEN);
+			/* Set ADC to one-shot mode */
+			inst->ADCCNF &= ~BIT(NPCX_ADCCNF_ADCRPTC);
+		} else {
+			/* Start conversion again */
+			inst->ADCCNF |= BIT(NPCX_ADCCNF_START);
+		}
+	}
+}
+
+int adc_npcx_threshold_ctrl_set_param(const struct device *dev,
+				      const struct adc_npcx_threshold_control_t
+				      *control)
+{
+	struct adc_npcx_data *const data = DRV_DATA(dev);
+	struct adc_npcx_threshold_data *const t_data = data->threshold_data;
+	struct adc_npcx_threshold_control *const t_ctrl =
+					&t_data->control[control->th_sel];
+
+	if (!IS_ENABLED(CONFIG_ADC_CMP_NPCX))
+		return -EOPNOTSUPP;
+
+	if (!control || control->th_sel >= NPCX_ADC_THRESHOLD_COUNT)
+		return -EINVAL;
+
+	switch (control->param) {
+	case ADC_NPCX_THRESHOLD_PARAM_CHNSEL:
+		if (control->val > NPCX_ADC_CH_COUNT)
+			return -EINVAL;
+		t_ctrl->chnsel = (uint8_t)control->val;
+		break;
+
+	case ADC_NPCX_THRESHOLD_PARAM_L_H:
+		t_ctrl->l_h = !!control->val;
+		break;
+
+	case ADC_NPCX_THRESHOLD_PARAM_THVAL:
+		if (control->val >= NPCX_ADC_VREF_VOL || control->val == 0)
+			return -EINVAL;
+		t_ctrl->thrval = (uint16_t)control->val;
+		break;
+
+	case ADC_NPCX_THRESHOLD_PARAM_WORK:
+		if (control->val == 0)
+			return -EINVAL;
+		t_ctrl->work = (struct k_work *)control->val;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int adc_npcx_threshold_ctrl_setup(const struct device *dev,
+					 const uint8_t th_sel)
+{
+	struct adc_npcx_data *const data = DRV_DATA(dev);
+	struct adc_npcx_threshold_data *const t_data = data->threshold_data;
+	struct adc_npcx_threshold_control *const t_ctrl =
+					&t_data->control[th_sel];
+
+	if (th_sel >= NPCX_ADC_THRESHOLD_COUNT)
+		return -EINVAL;
+
+	adc_context_lock(&data->ctx, false, NULL);
+
+	if (t_data->active_thresholds & BIT(th_sel)) {
+		/* Unable to setup threshold parameters while active */
+		adc_context_release(&data->ctx, 0);
+		LOG_ERR("Threshold selected (%d) is active!", th_sel);
+		return -EBUSY;
+	}
+
+	if (t_ctrl->chnsel >= NPCX_ADC_CH_COUNT ||
+	    t_ctrl->thrval >= NPCX_ADC_VREF_VOL ||
+	    t_ctrl->thrval == 0 || t_ctrl->work == 0) {
+		adc_context_release(&data->ctx, 0);
+		LOG_ERR("Threshold selected (%d) is not configured!", th_sel);
+		return -EINVAL;
+	}
+
+	SET_FIELD(THRCTL(DRV_CONFIG(dev)->base, (th_sel + 1)),
+		  NPCX_THRCTL_CHNSEL, t_ctrl->chnsel);
+
+	if (t_ctrl->l_h)
+		THRCTL(DRV_CONFIG(dev)->base, (th_sel + 1)) |= BIT(NPCX_THRCTL_L_H);
+	else
+		THRCTL(DRV_CONFIG(dev)->base, (th_sel + 1)) &= ~BIT(NPCX_THRCTL_L_H);
+
+	/* Set the threshold value. */
+	SET_FIELD(THRCTL(DRV_CONFIG(dev)->base, (th_sel + 1)), NPCX_THRCTL_THRVAL,
+		  t_ctrl->thrval);
+
+	adc_context_release(&data->ctx, 0);
+	return 0;
+}
+
+static int adc_npcx_threshold_enable_irq(const struct device *dev,
+				  const uint8_t th_sel)
+{
+	struct adc_reg *const inst = HAL_INSTANCE(dev);
+	struct adc_npcx_data *const data = DRV_DATA(dev);
+	struct adc_npcx_threshold_data *const t_data = data->threshold_data;
+	struct adc_npcx_threshold_control *const t_ctrl =
+					&t_data->control[th_sel];
+	uint16_t thrcts;
+
+	if (th_sel >= NPCX_ADC_THRESHOLD_COUNT) {
+		LOG_ERR("Invalid ADC threshold selection! (%d)", th_sel);
+		return -EINVAL;
+	}
+
+	adc_context_lock(&data->ctx, false, NULL);
+	if (t_ctrl->chnsel >= NPCX_ADC_CH_COUNT ||
+	    t_ctrl->thrval >= NPCX_ADC_VREF_VOL ||
+	    t_ctrl->thrval == 0 || t_ctrl->work == 0) {
+		adc_context_release(&data->ctx, 0);
+		LOG_ERR("Threshold selected (%d) is not configured!", th_sel);
+		return -EINVAL;
+	}
+
+	/* Record new active threshold */
+	t_data->active_thresholds |= BIT(th_sel);
+
+	/* avoid clearing other threshold status */
+	thrcts = inst->THRCTS & ~GENMASK(NPCX_ADC_THRESHOLD_COUNT - 1, 0);
+
+	/* Enable threshold detection */
+	THRCTL(DRV_CONFIG(dev)->base, (th_sel + 1)) |= BIT(NPCX_THRCTL_THEN);
+
+	/* clear threshold status */
+	thrcts |= BIT(th_sel);
+
+	/* set enable threshold status */
+	thrcts |= BIT(NPCX_THRCTS_THR1_IEN + th_sel);
+
+	inst->THRCTS = thrcts;
+
+	adc_npcx_set_repetitive(dev, t_data->control[th_sel].chnsel, true);
+
+	adc_context_release(&data->ctx, 0);
+	return 0;
+}
+
+int adc_npcx_threshold_disable_irq(const struct device *dev,
+				   const uint8_t th_sel)
+{
+	struct adc_reg *const inst = HAL_INSTANCE(dev);
+	struct adc_npcx_data *const data = DRV_DATA(dev);
+	struct adc_npcx_threshold_data *const t_data = data->threshold_data;
+	uint16_t thrcts;
+
+	if (!IS_ENABLED(CONFIG_ADC_CMP_NPCX))
+		return -EOPNOTSUPP;
+
+	if (th_sel >= NPCX_ADC_THRESHOLD_COUNT) {
+		LOG_ERR("Invalid ADC threshold selection! (%d)", th_sel);
+		return -EINVAL;
+	}
+
+	adc_context_lock(&data->ctx, false, NULL);
+	if (!(t_data->active_thresholds & BIT(th_sel))) {
+		adc_context_release(&data->ctx, 0);
+		LOG_ERR("Threshold selection (%d) is not enabled", th_sel);
+		return -ENODEV;
+	}
+	/* avoid clearing other threshold status */
+	thrcts = inst->THRCTS & ~GENMASK(NPCX_ADC_THRESHOLD_COUNT - 1, 0);
+
+	/* set enable threshold status */
+	thrcts &= ~BIT(NPCX_THRCTS_THR1_IEN + th_sel);
+	inst->THRCTS = thrcts;
+
+	/* Disable threshold detection */
+	THRCTL(DRV_CONFIG(dev)->base, (th_sel + 1)) &= ~BIT(NPCX_THRCTL_THEN);
+
+	/* Update active threshold */
+	t_data->active_thresholds &= ~BIT(th_sel);
+
+	adc_npcx_set_repetitive(dev, t_data->control[th_sel].chnsel, false);
+
+	adc_context_release(&data->ctx, 0);
+
+	return 0;
+}
+
+int adc_npcx_threshold_ctrl_enable(const struct device *dev, uint8_t th_sel,
+				   const bool enable)
+{
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_ADC_CMP_NPCX))
+		return -EOPNOTSUPP;
+
+	/* Enable/Disable threshold IRQ */
+	if (enable) {
+		/* Set control threshold registers */
+		ret = adc_npcx_threshold_ctrl_setup(dev, th_sel);
+		if (ret)
+			return ret;
+		ret = adc_npcx_threshold_enable_irq(dev, th_sel);
+	} else {
+		ret = adc_npcx_threshold_disable_irq(dev, th_sel);
+	}
+	return ret;
+}
+
 /* ADC driver registration */
 static const struct adc_driver_api adc_npcx_driver_api = {
 	.channel_setup = adc_npcx_channel_setup,
@@ -315,6 +642,8 @@ static const struct adc_npcx_config adc_npcx_cfg_0 = {
 	.clk_cfg = NPCX_DT_CLK_CFG_ITEM(0),
 	.alts_list = adc_alts,
 };
+
+static struct adc_npcx_threshold_data threshold_data_0;
 
 static struct adc_npcx_data adc_npcx_data_0 = {
 	ADC_CONTEXT_INIT_TIMER(adc_npcx_data_0, ctx),
@@ -370,6 +699,9 @@ static int adc_npcx_init(const struct device *dev)
 	inst->ADCCNF2 = ADC_REGULAR_ADCCNF2_VAL;
 	inst->GENDLY = ADC_REGULAR_GENDLY_VAL;
 	inst->MEAST = ADC_REGULAR_MEAST_VAL;
+
+	if (IS_ENABLED(CONFIG_ADC_CMP_NPCX))
+		data->threshold_data = &threshold_data_0;
 
 	/* Configure ADC interrupt and enable it */
 	IRQ_CONNECT(DT_INST_IRQN(0), DT_INST_IRQ(0, priority), adc_npcx_isr,

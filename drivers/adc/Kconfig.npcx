@@ -10,3 +10,14 @@ config ADC_NPCX
 	  This option enables the ADC driver for NPCX family of
 	  processors.
 	  Say y if you wish to use ADC channels on NPCX MCU.
+
+if ADC_NPCX
+
+menuconfig ADC_CMP_NPCX
+	bool "Nuvoton NPCX ADC threshold detection interruption"
+	default n
+	help
+	  This option enables threshold interruption using sensor
+	  trigger API.
+
+endif # ADC_NPCX
