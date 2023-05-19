@@ -19,6 +19,7 @@ add_subdirectory(task_wdt)
 add_subdirectory(testsuite)
 add_subdirectory(tracing)
 add_subdirectory(usb)
+add_subdirectory(ap_pwrseq)
 
 add_subdirectory_ifdef(CONFIG_BT bluetooth)
 add_subdirectory_ifdef(CONFIG_CONSOLE_SUBSYS console)
