@@ -1,0 +1,4 @@
+tests:
+  ap_pwrseq.general:
+    platform_allow:
+      - native_posix
