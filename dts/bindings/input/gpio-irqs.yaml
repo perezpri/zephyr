@@ -1,0 +1,86 @@
+# Copyright 2024 Google LLC
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+description: |
+  GPIO IRQ bindings.
+
+  After defining the devicetree nodes, register callbacks in C using the
+  GPIO_IRQS_CALLBACK_DEFINE macro. The first argument is the device
+  reference, the second is the handler function, and the third is an
+  optional user data pointer.
+
+  Devicetree example:
+
+    #include <zephyr/dt-bindings/gpio/gpio.h>
+
+    / {
+            gpio_irqs {
+                    compatible = "gpio-irqs";
+
+                    sensor_drdy: sensor-data-ready {
+                            gpios = <&gpio0 5 GPIO_ACTIVE_HIGH>;
+                            flags = <(GPIO_INT_EDGE_RISING)>;
+                            debounce-ms = <5>;
+                            enable-on-init;
+                            fire-on-init;
+                    };
+
+                    fault_line: fault-line {
+                            gpios = <&gpio0 6 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+                            flags = <(GPIO_INT_EDGE_FALLING)>;
+                    };
+            };
+    };
+
+  C usage example:
+
+    #include <zephyr/drivers/gpio_irqs.h>
+
+    static void sensor_drdy_handler(const struct device *dev, void *user_data)
+    {
+            /* Handle sensor data-ready event */
+    }
+
+    static void fault_line_handler(const struct device *dev, void *user_data)
+    {
+            /* Handle fault line event */
+    }
+
+    GPIO_IRQS_CALLBACK_DEFINE(DEVICE_DT_GET(DT_NODELABEL(sensor_drdy)),
+                              sensor_drdy_handler, NULL);
+
+    GPIO_IRQS_CALLBACK_DEFINE(DEVICE_DT_GET(DT_NODELABEL(fault_line)),
+                              fault_line_handler, NULL);
+
+compatible: "gpio-irqs"
+
+child-binding:
+  description: GPIO IRQ definition.
+
+  properties:
+    gpios:
+      type: phandle-array
+      required: true
+      description: |
+        GPIO that will detect interruption.
+
+    flags:
+      type: int
+      description: The zephyr gpio interrupt config flags.
+
+    debounce-ms:
+      type: int
+      default: 0
+      description: |
+        Debounce time in milliseconds.
+
+    enable-on-init:
+      type: boolean
+      description: |
+        Defines if this irq is enabled once initialized.
+
+    fire-on-init:
+      type: boolean
+      description: |
+        Defines if this irq is fired one time after it has been initialized.

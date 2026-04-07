@@ -1,0 +1,22 @@
+# Copyright 2024 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+
+config INPUT_GPIO_IRQS
+	bool "GPIO IRQ input driver"
+	default y
+	depends on DT_HAS_GPIO_IRQS_ENABLED
+	select GPIO
+	help
+	  Enable support for the GPIO IRQ driver. This driver
+	  allows GPIO pins to be configured as interrupt sources with optional
+	  debounce support and callback registration.
+
+if INPUT_GPIO_IRQS
+
+config INPUT_GPIO_IRQS_INIT_PRIORITY
+	int "GPIO IRQ driver init priority"
+	default 100
+	help
+	  Initialization priority for the gpio-irqs driver instances.
+
+endif # INPUT_GPIO_IRQS

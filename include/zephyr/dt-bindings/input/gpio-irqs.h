@@ -1,0 +1,13 @@
+/*
+ * Copyright (c) 2024 Arif Balik <arifbalik@outlook.com>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef ZEPHYR_INCLUDE_DT_BINDINGS_GPIO_IRQS_H_
+#define ZEPHYR_INCLUDE_DT_BINDINGS_GPIO_IRQS_H_
+
+#define GPIO_IRQ_EDGE_FALLING (BIT(0))
+#define GPIO_IRQ_EDGE_RISING (BIT(1))
+#define GPIO_IRQ_EDGE_BOTH (GPIO_IRQ_EDGE_FALLING | GPIO_IRQ_EDGE_RISING)
+
+#endif /* ZEPHYR_INCLUDE_DT_BINDINGS_GPIO_IRQS_H_ */
