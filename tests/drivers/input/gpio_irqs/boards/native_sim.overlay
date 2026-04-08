@@ -1,0 +1,57 @@
+/*
+ * Copyright 2024 Google LLC
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <zephyr/dt-bindings/input/gpio-irqs.h>
+
+&gpio0 {
+	ngpios = <4>;
+};
+
+/ {
+	gpio_irqs_test {
+		compatible = "gpio-irqs";
+
+		/*
+		 * Basic IRQ - no enable-on-init, used to test manual
+		 * enable/disable and pin_get.
+		 */
+		basic_irq: basic-irq {
+			gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
+			flags = <(GPIO_IRQ_EDGE_BOTH)>;
+		};
+
+		/*
+		 * Debounce IRQ - enabled on init with a 30 ms debounce window,
+		 * used to verify that callbacks are only fired once the signal
+		 * is stable.
+		 */
+		debounce_irq: debounce-irq {
+			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+			flags = <(GPIO_IRQ_EDGE_RISING)>;
+			debounce-ms = <30>;
+			enable-on-init;
+		};
+
+		/*
+		 * Fire-on-init IRQ - callback is invoked once during device
+		 * initialisation without any GPIO activity.
+		 */
+		fire_init_irq: fire-init-irq {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+			flags = <(GPIO_IRQ_EDGE_RISING)>;
+			fire-on-init;
+		};
+
+		/*
+		 * Falling edge IRQ - used to verify that only falling edges
+		 * trigger the callback when GPIO_IRQ_EDGE_FALLING is set.
+		 */
+		falling_irq: falling-irq {
+			gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
+			flags = <(GPIO_IRQ_EDGE_FALLING)>;
+		};
+	};
+};
